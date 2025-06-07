@@ -1,0 +1,36 @@
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "kevinbotlib_networking"
+version = "0.1.0"
+description = 'Networking for KevinbotLib'
+readme = "README.md"
+requires-python = ">=3.10"
+license = "LGPL-3.0-or-later"
+keywords = []
+authors = [
+  { name = "meowmeowahr", email = "meowmeowahr@gmail.com" },
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: Implementation :: PyPy",
+]
+
+dependencies = [
+]
+
+[project.urls]
+Documentation = "https://github.com/meowmeowahr/kevinbotlib_networking#readme"
+Issues = "https://github.com/meowmeowahr/kevinbotlib_networking/issues"
+Source = "https://github.com/meowmeowahr/kevinbotlib_networking"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]

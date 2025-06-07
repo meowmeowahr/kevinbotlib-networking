@@ -1,0 +1,15 @@
+[package]
+name = "kevinbotlib_networking"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "kevinbotlib_networking"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.25", features = ["extension-module", "abi3"] }
+tokio = { version = "1.45.1", features = ["full"] }
+
+[dev-dependencies]
+
