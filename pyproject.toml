@@ -25,6 +25,7 @@ classifiers = [
 ]
 
 dependencies = [
+    "memray>=1.17.2",
 ]
 
 [project.urls]
