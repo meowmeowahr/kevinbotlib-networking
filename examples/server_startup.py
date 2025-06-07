@@ -11,6 +11,6 @@ srv.start()
 
 print("Server running:", srv.running)
 
-time.sleep(1)
+time.sleep(20)
 
-srv.stop() # TODO: Implement this
+srv.stop()
