@@ -1,5 +1,6 @@
 mod logging;
 mod server;
+mod client;
 
 use pyo3::prelude::*;
 
@@ -8,5 +9,6 @@ use pyo3::prelude::*;
 #[pymodule]
 fn kevinbotlib_networking(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<server::NetworkServer>()?;
+    m.add_class::<client::BlockingClient>()?;
     Ok(())
 }

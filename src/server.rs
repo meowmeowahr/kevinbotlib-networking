@@ -48,6 +48,13 @@ async fn handle_client(
                     response.push_str("ERROR Key not found\n");
                 }
             }
+            (Some("DEL"), Some(k), _) => {
+                if let Some(_) = store.write().await.remove(k) {
+                    response.push_str("OK\n");
+                } else {
+                    response.push_str("ERROR Key not found\n");
+                }
+            }
             _ => {
                 log_py(
                     &logger,
@@ -187,6 +194,7 @@ impl NetworkServer {
                             continue;
                         }
                     };
+                    stream.set_nodelay(true)?;
 
                     let store = store.clone();
                     let client_logger = logger_future.clone();

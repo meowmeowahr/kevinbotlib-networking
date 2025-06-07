@@ -7,10 +7,10 @@ def log(level: str, message: str):
 
 srv = NetworkServer("127.0.0.1", 8888)
 srv.logger = log
-srv.start()
 
-print("Server running:", srv.running)
-
-time.sleep(20)
-
-srv.stop()
+try:
+    srv.start()
+    while True:
+        time.sleep(1)
+finally:
+    srv.stop()
