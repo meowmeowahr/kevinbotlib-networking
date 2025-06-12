@@ -1,15 +1,22 @@
-use std::io::{BufRead, BufReader, Write};
+use pyo3::prelude::*;
+use pyo3::{pyclass, pymethods, PyObject, Python};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration};
-use pyo3::{pyclass, pymethods, PyObject, Python};
+use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use crate::logging::queue_log;
+
+struct StreamWrapper {
+    reader: BufReader<TcpStream>,
+    writer: BufWriter<TcpStream>,
+}
 
 #[pyclass]
 pub struct BlockingClient {
     host: String,
     port: u16,
-    stream: Option<TcpStream>,
+    stream_wrapper: Option<StreamWrapper>,
     logger: Arc<Mutex<Option<PyObject>>>,
     log_tx: Arc<Mutex<Option<UnboundedSender<(String, String)>>>>,
 }
@@ -18,20 +25,26 @@ pub struct BlockingClient {
 impl BlockingClient {
     #[new]
     pub fn new(host: &str, port: u16) -> Self {
-        Self {
+        let mut client = Self {
             host: host.to_string(),
             port,
-            stream: None,
+            stream_wrapper: None,
             logger: Arc::new(Mutex::new(None)),
             log_tx: Arc::new(Mutex::new(None)),
-        }
+        };
+
+        Python::with_gil(|py| {
+            let print_fn = py.import("builtins").unwrap().getattr("print").unwrap().into();
+            client.set_logger(py, print_fn);
+        });
+
+        client
     }
 
     #[setter]
     fn set_logger(&mut self, py: Python, callback: PyObject) {
         *self.logger.lock().unwrap() = Some(callback.clone_ref(py));
 
-        // Start the log drain task
         let logger = self.logger.clone();
         let (tx, mut rx): (
             UnboundedSender<(String, String)>,
@@ -61,140 +74,99 @@ impl BlockingClient {
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-        self.stream = Some(stream);
-        println!("Connected to server.");
+
+        let reader = BufReader::new(stream.try_clone()?);
+        let writer = BufWriter::new(stream);
+
+        self.stream_wrapper = Some(StreamWrapper { reader, writer });
         Ok(())
     }
 
-    pub fn disconnect(&mut self) {
-        if let Some(stream) = self.stream.take() {
-            drop(stream);
-            println!("Disconnected from server.");
-        }
+    pub fn close(&mut self) {
+        self.stream_wrapper = None;
     }
 
-    fn send_receive(&mut self, message: &str) -> std::io::Result<String> {
-        let stream = self.stream.as_mut().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotConnected, "Client not connected")
-        })?;
-
-        stream.write_all(message.as_bytes())?;
-        stream.write_all(b"\n")?;
-        stream.flush()?;
-
-        let mut reader = BufReader::new(stream.try_clone()?);
-        let mut response = String::new();
-        reader.read_line(&mut response)?;
-        Ok(response.trim_end().to_string())
+    #[getter]
+    pub fn connected(&self) -> bool {
+        self.stream_wrapper.is_some()
     }
 
     pub fn set(&mut self, key: &str, value: &str) -> bool {
-        match self.send_receive(&format!("SET {} {}", key, value)) {
+        let message = format!("SET {} {}\n", key, value);
+        match self.send_receive(&message) {
             Ok(resp) => resp == "OK",
             Err(e) => {
-                eprintln!("SET error: {}", e);
-                false
+                Err(e).unwrap()
             }
         }
     }
 
     pub fn get(&mut self, key: &str) -> Option<String> {
-        match self.send_receive(&format!("GET {}", key)) {
+        let message = format!("GET {}\n", key);
+        match self.send_receive(&message) {
             Ok(resp) => {
-                if resp.starts_with("ERROR") {
-                    eprintln!("GET error: {}", resp);
-                    None
-                } else {
-                    Some(resp)
-                }
+                Some(resp)
             }
             Err(e) => {
-                eprintln!("GET error: {}", e);
-                None
+                Err(e).unwrap()
             }
         }
     }
 
     pub fn delete(&mut self, key: &str) -> bool {
-        match self.send_receive(&format!("DEL {}", key)) {
+        let message = format!("DEL {}\n", key);
+        match self.send_receive(&message) {
             Ok(resp) => resp == "OK",
             Err(e) => {
-                eprintln!("SET error: {}", e);
-                false
+                Err(e).unwrap()
             }
         }
+    }
+
+    pub fn get_all_keys(&mut self) -> Vec<String> {
+        let message = "GAK\n".to_string();
+        match self.send_receive(&message) {
+            Ok(resp) => {
+                resp.split_whitespace().map(|s| s.to_string()).collect()
+            },
+            Err(e) => {
+                Err(e).unwrap()
+            }
+        }
+    }
+
+    pub fn get_key_count(&mut self) -> u64 {
+        let message = "GKC\n".to_string();
+        match self.send_receive(&message) {
+            Ok(resp) => {
+                resp.parse::<u64>().unwrap_or(0)
+            },
+            Err(e) => {
+                Err(e).unwrap()
+            }
+        }
+    }
+
+    pub fn send_command(&mut self, command: &str) -> std::io::Result<String> {
+        let message = format!("{}\n", command);
+        self.send_receive(&message)
     }
 }
 
 impl BlockingClient {
-    /// Instance method for logging
-    fn log(&self, level: &str, message: &str) {
-        if let Some(cb) = self.logger.lock().unwrap().as_ref() {
-            Python::with_gil(|py| {
-                let _ = cb.call1(py, (level, message));
-            });
-        }
+    fn send_receive(&mut self, message: &str) -> std::io::Result<String> {
+        let stream_wrapper = self.stream_wrapper.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "Client not connected")
+        })?;
+
+        // Write
+        stream_wrapper.writer.write_all(message.as_bytes())?;
+        stream_wrapper.writer.flush()?;
+
+        // Read
+        let mut response = String::new();
+        stream_wrapper.reader.read_line(&mut response)?;
+
+        Ok(response.trim_end().to_string())
     }
 }
-
-
-// fn main() {
-//     const SERVER_HOST: &str = "127.0.0.1";
-//     const SERVER_PORT: u16 = 8888;
-//     const NUM_OPERATIONS: usize = 1000;
-//     const VALUE_SIZE: usize = 100;
-//
-//     let data = random_string(VALUE_SIZE);
-//
-//     let mut client = BlockingClient::new(SERVER_HOST, SERVER_PORT);
-//     if let Err(e) = client.connect() {
-//         eprintln!("Failed to connect: {}", e);
-//         return;
-//     }
-//
-//     // SET operations
-//     println!("Starting {} SET operations...", NUM_OPERATIONS);
-//     let start = Instant::now();
-//     let mut set_success = 0;
-//     for i in 0..NUM_OPERATIONS {
-//         let key = format!("key_{}", i);
-//         if client.set(&key, &data) {
-//             set_success += 1;
-//         }
-//         if i % (NUM_OPERATIONS / 10).max(1) == 0 {
-//             println!("  {}/{} SETs completed...", i, NUM_OPERATIONS);
-//         }
-//     }
-//     let duration = start.elapsed();
-//     println!(
-//         "Completed SETs in {:.4}s, success: {} / {}, avg: {:.4}ms",
-//         duration.as_secs_f64(),
-//         set_success,
-//         NUM_OPERATIONS,
-//         duration.as_secs_f64() * 1000.0 / set_success.max(1) as f64
-//     );
-//
-//     // GET operations
-//     println!("Starting {} GET operations...", NUM_OPERATIONS);
-//     let start = Instant::now();
-//     let mut get_success = 0;
-//     for i in 0..NUM_OPERATIONS {
-//         let key = format!("key_{}", i);
-//         if let Some(_val) = client.get(&key) {
-//             get_success += 1;
-//         }
-//         if i % (NUM_OPERATIONS / 10).max(1) == 0 {
-//             println!("  {}/{} GETs completed...", i, NUM_OPERATIONS);
-//         }
-//     }
-//     let duration = start.elapsed();
-//     println!(
-//         "Completed GETs in {:.4}s, success: {} / {}, avg: {:.4}ms",
-//         duration.as_secs_f64(),
-//         get_success,
-//         NUM_OPERATIONS,
-//         duration.as_secs_f64() * 1000.0 / get_success.max(1) as f64
-//     );
-//
-//     client.disconnect();
-// }

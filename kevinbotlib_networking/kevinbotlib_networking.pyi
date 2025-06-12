@@ -32,7 +32,7 @@ class BlockingClient:
     def connect(self) -> None:
         ...
 
-    def disconnect(self) -> None:
+    def close(self) -> None:
         ...
 
     def set(self, key: str, value: str) -> None:
@@ -41,5 +41,18 @@ class BlockingClient:
     def get(self, key: str) -> str | None:
         ...
 
+    def get_all_keys(self) -> list[str]:
+        ...
+
+    def get_key_count(self) -> int:
+        ...
+
     def delete(self, key: str) -> None:
+        ...
+
+    def send_command(self, message: str) -> str:
+        ...
+
+    @property
+    def connected(self) -> bool:
         ...

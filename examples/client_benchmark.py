@@ -78,8 +78,7 @@ if __name__ == '__main__':
         if del_success_count > 0:
             print(f"  Average DEL time per operation: {time_elapsed_get / del_success_count * 1000:.4f} ms")
 
-
     except RuntimeError as e:
         print(f"Client operation failed: {e}")
     finally:
-        client.disconnect()
+        client.close()

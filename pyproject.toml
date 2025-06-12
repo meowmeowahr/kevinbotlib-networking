@@ -28,6 +28,11 @@ dependencies = [
     "memray>=1.17.2",
 ]
 
+[project.optional-dependencies]
+dev = [
+  "maturin-import-hook>=0.2.0",
+]
+
 [project.urls]
 Documentation = "https://github.com/meowmeowahr/kevinbotlib_networking#readme"
 Issues = "https://github.com/meowmeowahr/kevinbotlib_networking/issues"

@@ -1,73 +1,88 @@
+use bytes::Bytes;
+use dashmap::DashMap;
 use pyo3::prelude::*;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tokio::sync::RwLock;
 
 use crate::logging::{log_py, queue_log};
 
-type SharedStore = Arc<RwLock<HashMap<String, String>>>;
+type SharedStore = Arc<DashMap<String, Bytes>>;
 
 async fn handle_client(
-    stream: TcpStream,
+    mut stream: TcpStream,
     store: SharedStore,
     logger: Arc<Mutex<Option<PyObject>>>,
 ) {
     let addr = stream.peer_addr().unwrap();
+    let _ = stream.set_nodelay(true);
     log_py(
         &logger,
         "debug",
         &format!("Accepted connection from {:?}", addr),
     );
 
-    let (reader, mut writer) = stream.into_split();
+    let (reader, writer) = stream.split();
     let mut reader = BufReader::new(reader).lines();
+    let mut writer = BufWriter::new(writer);
 
     while let Ok(Some(line)) = reader.next_line().await {
-        let parts: Vec<&str> = line.trim().splitn(3, ' ').collect();
-        let command = parts.get(0).map(|s| s.to_uppercase());
-        let key = parts.get(1).copied();
-        let value = parts.get(2).copied();
+        let mut response: Vec<u8> = Vec::new();
 
-        let mut response = String::new();
-
-        match (command.as_deref(), key, value) {
-            (Some("SET"), Some(k), Some(v)) => {
-                store.write().await.insert(k.to_string(), v.to_string());
-                response.push_str("OK\n");
+        if line.starts_with("SET ") {
+            if let Some((k, v)) = line[4..].split_once(' ') {
+                store.insert(k.to_string(), Bytes::from(v.to_owned()));
+                response.extend_from_slice(b"OK\n");
+            } else {
+                response.extend_from_slice(b"ERROR Invalid SET command\n");
             }
-            (Some("GET"), Some(k), _) => {
-                if let Some(val) = store.read().await.get(k) {
-                    response.push_str(val);
-                    response.push('\n');
-                } else {
-                    response.push_str("ERROR Key not found\n");
-                }
+        } else if line.starts_with("GET ") {
+            let key = &line[4..];
+            if let Some(val) = store.get(key) {
+                response.extend_from_slice(val.value());
+                response.push(b'\n');
+            } else {
+                response.extend_from_slice(b"ERROR Key not found\n");
             }
-            (Some("DEL"), Some(k), _) => {
-                if let Some(_) = store.write().await.remove(k) {
-                    response.push_str("OK\n");
-                } else {
-                    response.push_str("ERROR Key not found\n");
-                }
+        } else if line.starts_with("DEL ") {
+            let key = &line[4..];
+            if store.remove(key).is_some() {
+                store.shrink_to_fit();
+                response.extend_from_slice(b"OK\n");
+            } else {
+                response.extend_from_slice(b"ERROR Key not found\n");
             }
-            _ => {
-                log_py(
-                    &logger,
-                    "warn",
-                    &format!("Invalid command from {:?}: {}", addr, line),
-                );
-                response.push_str("ERROR Invalid command or arguments\n");
-            }
+        } else if line.trim() == "GKC" {
+            let count = store.len();
+            response.extend_from_slice(count.to_string().as_bytes());
+            response.push(b'\n');
+        } else if line.trim() == "GAK" {
+            // get all keys as csv
+            let keys: Vec<String> = store.iter().map(|r| r.key().clone()).collect();
+            response.extend_from_slice(keys.join(" ").as_bytes());
+            response.push(b'\n');
+        } else if line.trim() == "QUIT" {
+            log_py(&logger, "debug", &format!("Quit requested from {:?}", addr));
+            stream.shutdown().await.unwrap();
+            break;
+        } else if line.trim() == "PING" {
+            response.extend_from_slice(b"PONG\n");
+        } else {
+            log_py(
+                &logger,
+                "warn",
+                &format!("Invalid command from {:?}: {}", addr, line),
+            );
+            response.extend_from_slice(b"ERROR Invalid command or arguments\n");
         }
 
-        if writer.write_all(response.as_bytes()).await.is_err() {
+        if writer.write_all(&response).await.is_err() {
             break;
         }
+        let _ = writer.flush().await;
     }
 
     log_py(
@@ -92,7 +107,7 @@ pub struct NetworkServer {
 impl NetworkServer {
     #[new]
     fn new(host: String, port: u16) -> Self {
-        Self {
+        let mut server = Self {
             host,
             port,
             running: Arc::new(Mutex::new(false)),
@@ -100,14 +115,25 @@ impl NetworkServer {
             shutdown: Arc::new(AtomicBool::new(false)),
             thread_handle: Arc::new(Mutex::new(None)),
             log_tx: Arc::new(Mutex::new(None)),
-        }
+        };
+
+        Python::with_gil(|py| {
+            let print_fn = py
+                .import("builtins")
+                .unwrap()
+                .getattr("print")
+                .unwrap()
+                .into();
+            server.set_logger(py, print_fn);
+        });
+
+        server
     }
 
     #[setter]
     fn set_logger(&mut self, py: Python, callback: PyObject) {
         *self.logger.lock().unwrap() = Some(callback.clone_ref(py));
 
-        // Start the log drain task
         let logger = self.logger.clone();
         let (tx, mut rx): (
             UnboundedSender<(String, String)>,
@@ -131,12 +157,11 @@ impl NetworkServer {
         .unwrap();
     }
 
-    /// Start the server
     fn start(&self) {
         let addr = match format!("{}:{}", self.host, self.port).parse::<SocketAddr>() {
             Ok(addr) => addr,
             Err(e) => {
-                self.log("error", &format!("Invalid address: {}", e));
+                queue_log(&self.log_tx, "error", &format!("Invalid address: {}", e));
                 return;
             }
         };
@@ -159,11 +184,12 @@ impl NetworkServer {
 
         let thread_handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(num_cpus::get())
                 .enable_all()
                 .build()
                 .unwrap();
 
-            let store: SharedStore = Arc::new(RwLock::new(HashMap::new()));
+            let store: SharedStore = Arc::new(DashMap::new());
             let logger_future = logger.clone();
             let shutdown_flag = shutdown.clone();
             let shutdown_flag_inner = shutdown_flag.clone();
@@ -178,12 +204,11 @@ impl NetworkServer {
                     let accept_result = tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
                             if shutdown_flag_inner.load(Ordering::SeqCst) {
-                                store.write().await.clear();
+                                store.clear();
                                 break;
                             }
                             continue;
                         }
-
                         result = listener.accept() => result,
                     };
 
@@ -194,7 +219,6 @@ impl NetworkServer {
                             continue;
                         }
                     };
-                    stream.set_nodelay(true)?;
 
                     let store = store.clone();
                     let client_logger = logger_future.clone();
@@ -211,12 +235,13 @@ impl NetworkServer {
             *running_flag.lock().unwrap() = false;
             shutdown_flag.store(false, Ordering::SeqCst);
         });
+
         *self.thread_handle.lock().unwrap() = Some(thread_handle);
     }
 
     fn stop(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        self.log("debug", "Shutdown requested");
+        queue_log(&self.log_tx, "debug", "Shutting down server...");
         if let Some(handle) = self.thread_handle.lock().unwrap().take() {
             let _ = handle.join();
         }
@@ -225,16 +250,5 @@ impl NetworkServer {
     #[getter]
     fn running(&self) -> bool {
         *self.running.lock().unwrap()
-    }
-}
-
-impl NetworkServer {
-    /// Instance method for logging
-    fn log(&self, level: &str, message: &str) {
-        if let Some(cb) = self.logger.lock().unwrap().as_ref() {
-            Python::with_gil(|py| {
-                let _ = cb.call1(py, (level, message));
-            });
-        }
     }
 }

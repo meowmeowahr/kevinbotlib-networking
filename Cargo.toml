@@ -11,6 +11,9 @@ crate-type = ["cdylib"]
 pyo3 = { version = "0.25", features = ["extension-module", "abi3"] }
 pyo3-async-runtimes = { version = "0.25.0", features = ["tokio-runtime"] }
 tokio = { version = "1.45.1", features = ["full"] }
+bytes = "1.10.1"
+dashmap = "7.0.0-rc2"
+num_cpus = "1.17.0"
 
 [dev-dependencies]
 
